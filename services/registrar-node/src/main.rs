@@ -295,6 +295,8 @@ async fn register_resource(
     Json(submission): Json<ResourceRegistrationSubmission>,
 ) -> ApiResult<Value> {
     submission.validate_shape().map_err(ApiError::bad_request)?;
+    let authorized_domains =
+        validate_resource_authorized_domains_for_registrar(&state, &submission)?;
     let request = build_resource_verify_and_publish_request(&state, submission.clone())?;
     let response = state
         .client
@@ -330,6 +332,7 @@ async fn register_resource(
         "didDocumentHash": did_document_hash,
         "metadataHash": submission.metadata_hash,
         "packageHash": submission.package_hash,
+        "authorizedDomains": authorized_domains,
         "registrationCredential": registration_credential,
         "rootResponse": body,
         "submittedAt": chrono::Utc::now()
@@ -342,6 +345,117 @@ async fn register_resource(
         "registrationCredential": record["registrationCredential"],
         "rootResponse": record["rootResponse"]
     })))
+}
+
+fn validate_resource_authorized_domains_for_registrar(
+    state: &AppState,
+    submission: &ResourceRegistrationSubmission,
+) -> std::result::Result<Vec<String>, ApiError> {
+    let registrar_document: DidDocument = state
+        .data
+        .read("did-document.json")
+        .map_err(ApiError::internal)?;
+    let registrar_domains = registrar_document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| metadata.authorized_domains.clone())
+        .unwrap_or_default();
+    let resource_domains = submission
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| metadata.authorized_domains.clone())
+        .unwrap_or_default();
+
+    if let Some(metadata_domains) = submission
+        .metadata
+        .get("authorizedDomains")
+        .and_then(Value::as_array)
+        .map(|domains| {
+            domains
+                .iter()
+                .map(|domain| {
+                    domain
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .ok_or_else(|| "invalid_authorized_domains".to_owned())
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .map_err(ApiError::bad_request)?
+    {
+        if metadata_domains != resource_domains {
+            return Err(ApiError::bad_request("authorized_domains_mismatch"));
+        }
+    }
+
+    validate_resource_authorized_domains(&resource_domains, &registrar_domains)
+        .map_err(ApiError::bad_request)?;
+    Ok(resource_domains)
+}
+
+fn validate_authorized_domain_list(domains: &[String]) -> std::result::Result<(), String> {
+    if domains.iter().any(|domain| domain == "*") {
+        return if domains.len() == 1 {
+            Ok(())
+        } else {
+            Err("invalid_authorized_domains".to_owned())
+        };
+    }
+    for domain in domains {
+        if domain.trim().is_empty()
+            || domain != domain.trim()
+            || domain.contains("..")
+            || domain.starts_with('.')
+            || domain.ends_with('.')
+        {
+            return Err("invalid_authorized_domains".to_owned());
+        }
+    }
+    if domains.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("invalid_authorized_domains".to_owned());
+    }
+    Ok(())
+}
+
+fn authorized_domain_covers(granted: &str, requested: &str) -> bool {
+    granted == requested
+        || requested
+            .strip_prefix(granted)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+fn authorized_domains_cover(granted: &[String], requested: &[String]) -> bool {
+    if requested.is_empty() {
+        return true;
+    }
+    if granted.iter().any(|domain| domain == "*") {
+        return true;
+    }
+    if granted.is_empty() {
+        return false;
+    }
+    requested.iter().all(|requested_domain| {
+        granted
+            .iter()
+            .any(|granted_domain| authorized_domain_covers(granted_domain, requested_domain))
+    })
+}
+
+fn validate_resource_authorized_domains(
+    resource_domains: &[String],
+    registrar_domains: &[String],
+) -> std::result::Result<(), String> {
+    if resource_domains.is_empty() {
+        return Err("resource_domains_required".to_owned());
+    }
+    validate_authorized_domain_list(resource_domains)?;
+    validate_authorized_domain_list(registrar_domains)?;
+    if !authorized_domains_cover(registrar_domains, resource_domains) {
+        return Err("unauthorized_domains".to_owned());
+    }
+    Ok(())
 }
 
 fn build_resource_verify_and_publish_request(
@@ -378,6 +492,12 @@ fn issue_resource_registration_credential(
 ) -> std::result::Result<Value, ApiError> {
     let issued_at = chrono::Utc::now();
     let key_id = format!("{}#key-1", state.did);
+    let authorized_domains = submission
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| metadata.authorized_domains.clone())
+        .unwrap_or_default();
     let mut credential = json!({
         "@context": [
             "https://www.w3.org/2018/credentials/v1",
@@ -399,6 +519,7 @@ fn issue_resource_registration_credential(
             "packageHash": submission.package_hash,
             "packageVersion": submission.package_version,
             "hashAlgorithm": submission.hash_algorithm,
+            "authorizedDomains": authorized_domains,
             "lifecycleState": submission.metadata["lifecycleState"].as_str().unwrap_or("active")
         },
         "credentialStatus": {
