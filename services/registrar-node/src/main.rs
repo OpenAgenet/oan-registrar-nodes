@@ -19,14 +19,16 @@ use oan_crypto::{hash_json_with_suite, signing_key_from_bytes, SigningKey};
 use oan_protocol::{
     HealthResponse, ResourceRegistrationSubmission, ResourceVerifyAndPublishRequest,
     OAN_RESOURCE_PROTOCOL_VERSION, PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
-    PURPOSE_VERIFY_AND_PUBLISH,
+    PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION, PURPOSE_VERIFY_AND_PUBLISH,
 };
 use oan_semantic_recommender::{
     normalize_capability_tags, RegistrationSuggestionContext, RegistrationSuggestionInput,
     SemanticRecommender,
 };
 use oan_service_security::{
-    create_signed_request_envelope, request_id, request_nonce, SignedRequestEnvelopeInput,
+    create_signed_request_envelope, request_id, request_nonce,
+    verify_controller_authorization_proof, ControllerAuthorizationVerificationContext,
+    SignedRequestEnvelopeInput,
 };
 use oan_storage::{
     did_to_file_name, DatabaseBackend, DatabaseConfig, JsonStore, PostgresJsonStore,
@@ -386,6 +388,8 @@ async fn register_resource(
     Json(submission): Json<ResourceRegistrationSubmission>,
 ) -> ApiResult<Value> {
     submission.validate_shape().map_err(ApiError::bad_request)?;
+    verify_controller_authorization_for_submission(&state, &submission)
+        .map_err(ApiError::bad_request)?;
     let authorized_domains =
         validate_resource_authorized_domains_for_registrar(&state, &submission)?;
     let request = build_resource_verify_and_publish_request(&state, submission.clone())?;
@@ -436,6 +440,54 @@ async fn register_resource(
         "registrationCredential": record["registrationCredential"],
         "rootResponse": record["rootResponse"]
     })))
+}
+
+fn verify_controller_authorization_for_submission(
+    state: &AppState,
+    submission: &ResourceRegistrationSubmission,
+) -> std::result::Result<Option<String>, String> {
+    let Some(metadata) = submission.did_document.oan_metadata.as_ref() else {
+        return Ok(None);
+    };
+    let Some(controller_did) = metadata.controller_did.as_deref() else {
+        return Ok(None);
+    };
+    if controller_did == submission.resource_did {
+        return Ok(None);
+    }
+    let Some(bundle) = submission.controller_authorization_proof.as_ref() else {
+        eprintln!(
+            "controller authorization proof missing for resource {} controlled by {}",
+            submission.resource_did, controller_did
+        );
+        return Err("controller_authorization_proof_required".to_owned());
+    };
+    let expected_publisher_did = metadata
+        .publisher_did
+        .as_deref()
+        .filter(|publisher_did| *publisher_did == controller_did);
+    verify_controller_authorization_proof(
+        bundle,
+        &ControllerAuthorizationVerificationContext {
+            expected_resource_did: &submission.resource_did,
+            expected_controller_did: controller_did,
+            expected_publisher_did,
+            expected_did_document_hash: &submission.did_document_hash,
+            expected_metadata_hash: &submission.metadata_hash,
+            expected_registrar_did: &state.did,
+            expected_purpose: PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION,
+            now: Utc::now(),
+        },
+    )
+    .map(Some)
+    .map_err(|err| {
+        let message = err.to_string();
+        eprintln!(
+            "controller authorization proof rejected for resource {} controlled by {}: {}",
+            submission.resource_did, controller_did, message
+        );
+        message
+    })
 }
 
 fn validate_resource_authorized_domains_for_registrar(
