@@ -26,7 +26,7 @@ use oan_semantic_recommender::{
     SemanticRecommender,
 };
 use oan_service_security::{
-    create_signed_request_envelope, request_id, request_nonce,
+    create_signed_request_envelope, request_id, request_nonce, verify_and_store_nonce,
     verify_controller_authorization_proof, ControllerAuthorizationVerificationContext,
     SignedRequestEnvelopeInput,
 };
@@ -119,6 +119,8 @@ struct PathConfig {
     records_dir: PathBuf,
     #[serde(default = "default_keys_dir")]
     keys_dir: PathBuf,
+    #[serde(default = "default_controller_authorization_nonce_file")]
+    controller_authorization_nonce_file: PathBuf,
     #[serde(default)]
     database_url: Option<String>,
 }
@@ -129,6 +131,10 @@ fn default_records_dir() -> PathBuf {
 
 fn default_keys_dir() -> PathBuf {
     PathBuf::from("../../data/registrar/keys")
+}
+
+fn default_controller_authorization_nonce_file() -> PathBuf {
+    PathBuf::from("../../data/registrar/controller-authorization-nonces.json")
 }
 
 fn default_root_did() -> String {
@@ -297,6 +303,8 @@ fn load_config(path: String) -> Result<Config> {
     config.paths.data_dir = resolve_relative(base, &config.paths.data_dir);
     config.paths.records_dir = resolve_relative(base, &config.paths.records_dir);
     config.paths.keys_dir = resolve_relative(base, &config.paths.keys_dir);
+    config.paths.controller_authorization_nonce_file =
+        resolve_relative(base, &config.paths.controller_authorization_nonce_file);
     if let Some(database_url) = config.paths.database_url.as_mut() {
         *database_url = resolve_database_url(base, database_url);
     }
@@ -462,11 +470,8 @@ fn verify_controller_authorization_for_submission(
         );
         return Err("controller_authorization_proof_required".to_owned());
     };
-    let expected_publisher_did = metadata
-        .publisher_did
-        .as_deref()
-        .filter(|publisher_did| *publisher_did == controller_did);
-    verify_controller_authorization_proof(
+    let expected_publisher_did = metadata.publisher_did.as_deref();
+    let verification_method = verify_controller_authorization_proof(
         bundle,
         &ControllerAuthorizationVerificationContext {
             expected_resource_did: &submission.resource_did,
@@ -476,10 +481,10 @@ fn verify_controller_authorization_for_submission(
             expected_metadata_hash: &submission.metadata_hash,
             expected_registrar_did: &state.did,
             expected_purpose: PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION,
+            max_clock_skew_seconds: 60,
             now: Utc::now(),
         },
     )
-    .map(Some)
     .map_err(|err| {
         let message = err.to_string();
         eprintln!(
@@ -487,7 +492,27 @@ fn verify_controller_authorization_for_submission(
             submission.resource_did, controller_did, message
         );
         message
-    })
+    })?;
+    verify_and_store_nonce(
+        &state.config.paths.controller_authorization_nonce_file,
+        &bundle.challenge.nonce,
+        Utc::now(),
+        Utc::now(),
+        300,
+    )
+    .map_err(|err| {
+        let message = if err.to_string() == "trusted_upstream_nonce_replayed" {
+            "controller_authorization_nonce_replayed".to_owned()
+        } else {
+            err.to_string()
+        };
+        eprintln!(
+            "controller authorization nonce rejected for resource {} controlled by {}: {}",
+            submission.resource_did, controller_did, message
+        );
+        message
+    })?;
+    Ok(Some(verification_method))
 }
 
 fn validate_resource_authorized_domains_for_registrar(
