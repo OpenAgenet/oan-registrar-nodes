@@ -1066,10 +1066,11 @@ async fn api_resource_detail(
 ) -> ApiResult<Value> {
     let record = read_resource_record(&state, &did)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("resource_not_found"))?;
     Ok(Json(json!({
         "resourceDid": did,
-        "record": record.as_ref().map(public_resource_record_projection)
+        "record": public_resource_record_projection(&record)
     })))
 }
 
