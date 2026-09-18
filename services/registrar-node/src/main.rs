@@ -1157,9 +1157,7 @@ fn verify_registration_credential_query(
     let access = record
         .get("registrationCredentialAccess")
         .and_then(Value::as_object)
-        .ok_or_else(|| {
-            ApiError::forbidden("registration_credential_access_unavailable_for_legacy_resource")
-        })?;
+        .ok_or_else(|| ApiError::forbidden("registration_credential_access_denied"))?;
     if access.get("enabled").and_then(Value::as_bool) != Some(true) {
         return Err(ApiError::forbidden("registration_credential_access_denied"));
     }
