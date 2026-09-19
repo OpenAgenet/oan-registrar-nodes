@@ -13,6 +13,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Datelike, Duration, Utc};
+use futures::TryStreamExt;
 use oan_core::{CapabilityTagTree, CryptoSuite, DidDocument};
 use oan_credentials::sign_credential;
 use oan_crypto::{
@@ -1180,22 +1181,16 @@ async fn api_resources(
     let mut next_did = None;
     let mut page_bytes = 0_usize;
     if let Some(sqlite) = &state.sqlite {
-        let rows = sqlx::query(
+        let mut rows = sqlx::query(
             "SELECT record_key, value_json FROM json_records
              WHERE namespace = ? AND record_key > ?
              ORDER BY record_key LIMIT ?",
         )
         .bind("registrar.resource_records")
         .bind(after_did)
-        .bind(i64::from(limit + 1))
-        .fetch_all(sqlite.pool())
-        .await
-        .map_err(ApiError::internal)?;
-        for (index, row) in rows.into_iter().enumerate() {
-            if index >= limit as usize {
-                has_more = true;
-                break;
-            }
+        .bind(i64::from(limit))
+        .fetch(sqlite.pool());
+        while let Some(row) = rows.try_next().await.map_err(ApiError::internal)? {
             let did = row.get::<String, _>(0);
             next_did = Some(did);
             let value_json = row.get::<String, _>(1);
@@ -1204,23 +1199,29 @@ async fn api_resources(
                 &mut page_bytes,
             )?);
         }
+        let probe_after = next_did.as_deref().unwrap_or(after_did);
+        has_more = sqlx::query(
+            "SELECT 1 FROM json_records
+             WHERE namespace = ? AND record_key > ?
+             LIMIT 1",
+        )
+        .bind("registrar.resource_records")
+        .bind(probe_after)
+        .fetch_optional(sqlite.pool())
+        .await
+        .map_err(ApiError::internal)?
+        .is_some();
     } else if let Some(postgres) = &state.postgres {
-        let rows = sqlx::query(
+        let mut rows = sqlx::query(
             "SELECT record_key, value_json::text FROM json_records
              WHERE namespace = $1 AND record_key > $2
              ORDER BY record_key LIMIT $3",
         )
         .bind("registrar.resource_records")
         .bind(after_did)
-        .bind(i64::from(limit + 1))
-        .fetch_all(postgres.pool())
-        .await
-        .map_err(ApiError::internal)?;
-        for (index, row) in rows.into_iter().enumerate() {
-            if index >= limit as usize {
-                has_more = true;
-                break;
-            }
+        .bind(i64::from(limit))
+        .fetch(postgres.pool());
+        while let Some(row) = rows.try_next().await.map_err(ApiError::internal)? {
             let did = row.get::<String, _>(0);
             next_did = Some(did);
             let value_json = row.get::<String, _>(1);
@@ -1229,6 +1230,18 @@ async fn api_resources(
                 &mut page_bytes,
             )?);
         }
+        let probe_after = next_did.as_deref().unwrap_or(after_did);
+        has_more = sqlx::query(
+            "SELECT 1 FROM json_records
+             WHERE namespace = $1 AND record_key > $2
+             LIMIT 1",
+        )
+        .bind("registrar.resource_records")
+        .bind(probe_after)
+        .fetch_optional(postgres.pool())
+        .await
+        .map_err(ApiError::internal)?
+        .is_some();
     } else {
         let records = read_resource_records(&state)
             .await
