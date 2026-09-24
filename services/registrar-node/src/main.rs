@@ -152,7 +152,7 @@ fn default_registration_credential_query_nonce_file() -> PathBuf {
 }
 
 fn default_root_did() -> String {
-    "did:oan:INRT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz".to_owned()
+    "did:oan:QwErT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz".to_owned()
 }
 
 fn default_stats_report_interval_seconds() -> u64 {
@@ -765,6 +765,18 @@ fn issue_resource_registration_credential(
         .as_ref()
         .map(|metadata| metadata.authorized_domains.clone())
         .unwrap_or_default();
+    let external_identifiers = submission
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| {
+            metadata
+                .external_identifiers
+                .iter()
+                .map(|identifier| json!({ "id": identifier.id }))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut credential = json!({
         "@context": [
             "https://www.w3.org/2018/credentials/v1",
@@ -787,6 +799,7 @@ fn issue_resource_registration_credential(
             "packageVersion": submission.package_version,
             "hashAlgorithm": submission.hash_algorithm,
             "authorizedDomains": authorized_domains,
+            "externalIdentifiers": external_identifiers,
             "lifecycleState": submission.metadata["lifecycleState"].as_str().unwrap_or("active")
         },
         "credentialStatus": {
