@@ -73,6 +73,8 @@ struct Config {
 struct ServerConfig {
     host: String,
     port: u16,
+    #[serde(default)]
+    endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -840,7 +842,12 @@ fn issue_resource_registration_credential(
         credential_status: Some(CredentialStatusReference {
             id: format!(
                 "{}/resources/{}/status",
-                state.did,
+                state
+                    .config
+                    .server
+                    .endpoint
+                    .as_deref()
+                    .unwrap_or("http://127.0.0.1:8000"),
                 did_to_file_name(&submission.resource_did)
             ),
             status_type: "OANResourceRegistrationStatus2026".to_owned(),
