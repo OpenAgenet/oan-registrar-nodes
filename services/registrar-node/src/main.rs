@@ -473,6 +473,8 @@ async fn register_resource(
             .map_err(ApiError::bad_request)?;
     let authorized_domains =
         validate_resource_authorized_domains_for_registrar(&state, &submission)?;
+    verify_did_document_proof(&submission.did_document)
+        .map_err(|error| ApiError::bad_request(format!("did_document_proof_invalid: {error}")))?;
     let request = build_resource_verify_and_publish_request(&state, submission.clone())?;
     let response = state
         .client
@@ -585,6 +587,8 @@ fn verify_controller_authorization_for_submission(
         );
         return Err("controller_authorization_proof_required".to_owned());
     };
+    verify_did_document_proof(&bundle.controller_did_document)
+        .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
     let expected_publisher_did = metadata.publisher_did.as_deref();
     let verification_method = verify_controller_authorization_proof(
         bundle,
