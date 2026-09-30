@@ -21,7 +21,9 @@ use oan_credentials::{
     ResourceRegistrationCredentialSubject,
 };
 use oan_crypto::{
-    hash_json_with_suite, signing_key_from_bytes, verify_payload_with_proof,
+    did_document_signature_input, hash_json_with_suite, public_key_jwk, sign_bytes_multibase,
+    signing_key_from_bytes, verify_did_document_proof,
+    verify_payload_with_proof,
     verifying_key_from_method, SigningKey,
 };
 use oan_protocol::{
@@ -285,6 +287,8 @@ async fn main() -> Result<()> {
     did_doc
         .validate_infrastructure_profile(ResourceType::RegistrarNode)
         .map_err(|error| anyhow!("invalid registrar DID document profile: {error}"))?;
+    verify_did_document_proof(&did_doc)
+        .map_err(|error| anyhow!("invalid registrar DID document proof: {error}"))?;
     let key: DevKeyFile = JsonStore::new(".").read(config.paths.keys_dir.join("keypair.json"))?;
     let crypto_suite = crypto_suite_from_algorithm(&key.algorithm)?;
     let signing_key = signing_key_from_bytes(
