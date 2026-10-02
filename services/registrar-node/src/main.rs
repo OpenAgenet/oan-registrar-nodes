@@ -20,10 +20,8 @@ use oan_credentials::{
     ResourceRegistrationCredentialSubject,
 };
 use oan_crypto::{
-    did_document_signature_input, hash_json_with_suite, public_key_jwk, sign_bytes_multibase,
-    signing_key_from_private_key_jwk, verify_did_document_proof_standard_blocking,
-    verify_did_document_proof_standard_value_blocking,
-    verify_payload_with_proof,
+    hash_json_with_suite, signing_key_from_private_key_jwk, verify_did_document_proof,
+    verify_did_document_proof_standard_value_blocking, verify_payload_with_proof,
     verifying_key_from_method, SigningKey,
 };
 use oan_protocol::{
@@ -256,8 +254,15 @@ type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
 const REGISTRATION_CREDENTIAL_QUERY_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 const REGISTRATION_CREDENTIAL_QUERY_NONCE_TTL_SECONDS: i64 = 600;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async { tokio::spawn(async_main()).await? })
+}
+
+async fn async_main() -> Result<()> {
     let config_path = env::args()
         .nth(1)
         .unwrap_or_else(|| "services/registrar-node/config.example.toml".to_owned());
@@ -445,14 +450,6 @@ async fn registrar_did_document(State(state): State<AppState>) -> ApiResult<DidD
         .map_err(ApiError::internal)
 }
 
-async fn register_resource(
-    State(state): State<AppState>,
-    Json(submission): Json<ResourceRegistrationSubmission>,
-) -> ApiResult<Value> {
-    let did_document = serde_json::to_value(&submission.did_document).map_err(ApiError::internal)?;
-    register_resource_with_raw_document(state, submission, did_document).await
-}
-
 async fn register_resource_raw(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
@@ -461,12 +458,12 @@ async fn register_resource_raw(
         .get("didDocument")
         .cloned()
         .ok_or_else(|| ApiError::bad_request("did_document_missing"))?;
-    verify_did_document_proof_standard_value_blocking(did_document.clone())
-        .map_err(|error| ApiError::bad_request(format!("did_document_proof_invalid: {error}")))?;
-    let submission: ResourceRegistrationSubmission =
-        serde_json::from_value(payload).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    verify_registration_did_document_for_wire(did_document.clone())?;
+    let submission: ResourceRegistrationSubmission = serde_json::from_value(payload)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     register_resource_with_raw_document(state, submission, did_document).await
 }
+
 
 async fn register_resource_with_raw_document(
     state: AppState,
@@ -481,10 +478,12 @@ async fn register_resource_with_raw_document(
             .map_err(ApiError::bad_request)?;
     let authorized_domains =
         validate_resource_authorized_domains_for_registrar(&state, &submission)?;
-    verify_did_document_proof_standard_value_blocking(raw_did_document.clone())
-        .map_err(|error| ApiError::bad_request(format!("did_document_proof_invalid: {error}")))?;
-    let request =
-        build_resource_verify_and_publish_request_with_raw(&state, submission.clone(), raw_did_document.clone())?;
+    verify_registration_did_document_for_wire(raw_did_document.clone())?;
+    let request = build_resource_verify_and_publish_request_with_raw(
+        &state,
+        submission.clone(),
+        raw_did_document.clone(),
+    )?;
     let response = state
         .client
         .post(format!(
@@ -576,6 +575,23 @@ async fn register_resource_with_raw_document(
     })))
 }
 
+fn verify_registration_did_document_for_wire(
+    raw_did_document: Value,
+) -> std::result::Result<(), ApiError> {
+    match verify_did_document_proof_standard_value_blocking(raw_did_document.clone()) {
+        Ok(()) => Ok(()),
+        Err(standard_error) => {
+            let did_document: DidDocument = serde_json::from_value(raw_did_document)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            verify_did_document_proof(&did_document).map_err(|fallback_error| {
+                ApiError::bad_request(format!(
+                    "did_document_proof_invalid: {standard_error}; fallback: {fallback_error}"
+                ))
+            })
+        }
+    }
+}
+
 fn verify_controller_authorization_for_submission(
     state: &AppState,
     submission: &ResourceRegistrationSubmission,
@@ -596,8 +612,11 @@ fn verify_controller_authorization_for_submission(
         );
         return Err("controller_authorization_proof_required".to_owned());
     };
-    verify_did_document_proof_standard_blocking(&bundle.controller_did_document)
-        .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
+    verify_registration_did_document_for_wire(
+        serde_json::to_value(&bundle.controller_did_document)
+            .map_err(|_| "controller_did_document_proof_invalid".to_owned())?,
+    )
+    .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
     let expected_publisher_did = metadata.publisher_did.as_deref();
     let verification_method = verify_controller_authorization_proof(
         bundle,
@@ -642,7 +661,6 @@ fn verify_controller_authorization_for_submission(
     })?;
     Ok(Some(verification_method))
 }
-
 
 fn validate_resource_authorized_domains_for_registrar(
     state: &AppState,
@@ -755,14 +773,6 @@ fn validate_resource_authorized_domains(
     Ok(())
 }
 
-fn build_resource_verify_and_publish_request(
-    state: &AppState,
-    submission: ResourceRegistrationSubmission,
-) -> std::result::Result<ResourceVerifyAndPublishRequest, ApiError> {
-    let raw_did_document = serde_json::to_value(&submission.did_document).map_err(ApiError::internal)?;
-    build_resource_verify_and_publish_request_with_raw(state, submission, raw_did_document)
-}
-
 fn build_resource_verify_and_publish_request_with_raw(
     state: &AppState,
     submission: ResourceRegistrationSubmission,
@@ -791,6 +801,7 @@ fn build_resource_verify_and_publish_request_with_raw(
         upstream_auth: envelope,
     })
 }
+
 
 fn issue_resource_registration_credential(
     state: &AppState,
