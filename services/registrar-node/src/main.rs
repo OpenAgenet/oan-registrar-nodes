@@ -189,6 +189,7 @@ const REGISTRAR_MAX_PAGE_SIZE: u32 = 500;
 const REGISTRAR_MAX_RECORD_BYTES: usize = 1024 * 1024;
 const REGISTRAR_MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
