@@ -190,6 +190,13 @@ const REGISTRAR_MAX_RECORD_BYTES: usize = 1024 * 1024;
 const REGISTRAR_MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
 const CONTROLLER_INDEX_BACKFILL_PAGE_SIZE: u32 = 100;
 const CONTROLLER_INDEX_BACKFILL_MAX_RECORDS: usize = 500;
+const CONTROLLER_INDEX_BACKFILL_STATE_FILE: &str = "controller-index/backfill-state.json";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ControllerBackfillState {
+    updated_at: String,
+    record_key: String,
+}
 
 
 #[derive(Debug, Serialize)]
@@ -782,7 +789,15 @@ async fn upsert_controller_index_from_document(
 async fn backfill_controller_index(state: &AppState) -> Result<usize> {
     let mut repaired = 0usize;
     let mut scanned = 0usize;
-    let mut cursor: Option<NamespacePageCursor> = None;
+    let mut cursor = state
+        .data
+        .read(CONTROLLER_INDEX_BACKFILL_STATE_FILE)
+        .ok()
+        .and_then(|value| serde_json::from_value::<ControllerBackfillState>(value).ok())
+        .map(|value| NamespacePageCursor {
+            updated_at: value.updated_at,
+            record_key: value.record_key,
+        });
     loop {
         if scanned >= CONTROLLER_INDEX_BACKFILL_MAX_RECORDS {
             break;
@@ -843,9 +858,19 @@ async fn backfill_controller_index(state: &AppState) -> Result<usize> {
             }
         }
         if !page.has_more {
+            let _ = std::fs::remove_file(state.data.resolve(CONTROLLER_INDEX_BACKFILL_STATE_FILE));
             break;
         }
         cursor = page.next_cursor;
+        if let Some(next) = cursor.as_ref() {
+            state.data.write(
+                CONTROLLER_INDEX_BACKFILL_STATE_FILE,
+                &json!(ControllerBackfillState {
+                    updated_at: next.updated_at.clone(),
+                    record_key: next.record_key.clone(),
+                }),
+            )?;
+        }
     }
     Ok(repaired)
 }
