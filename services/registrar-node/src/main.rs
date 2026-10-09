@@ -42,8 +42,8 @@ use oan_service_security::{
     VerificationRelationship,
 };
 use oan_storage::{
-    did_to_file_name, DatabaseBackend, DatabaseConfig, JsonStore, PostgresJsonStore,
-    SqliteJsonStore,
+    did_to_file_name, DatabaseBackend, DatabaseConfig, JsonStore, NamespacePageCursor,
+    PostgresJsonStore, QueryLimits, SqliteJsonStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -188,6 +188,8 @@ const REGISTRAR_DEFAULT_PAGE_SIZE: u32 = 100;
 const REGISTRAR_MAX_PAGE_SIZE: u32 = 500;
 const REGISTRAR_MAX_RECORD_BYTES: usize = 1024 * 1024;
 const REGISTRAR_MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
+const CONTROLLER_INDEX_BACKFILL_PAGE_SIZE: u32 = 100;
+const CONTROLLER_INDEX_BACKFILL_MAX_RECORDS: usize = 500;
 
 
 #[derive(Debug, Serialize)]
@@ -340,6 +342,13 @@ async fn async_main() -> Result<()> {
         .layer(build_cors_layer(&config.cors)?)
         .with_state(state.clone());
 
+    let backfill_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = backfill_controller_index(&backfill_state).await {
+            eprintln!("controller index backfill failed: {error}");
+        }
+    });
+
     if state.config.stats_report.enabled {
         let report_state = state.clone();
         tokio::spawn(async move {
@@ -476,6 +485,7 @@ async fn register_resource_with_raw_document(
         .map_err(ApiError::bad_request)?;
     let verified_controller_method =
         verify_controller_authorization_for_submission(&state, &submission)
+            .await
             .map_err(ApiError::bad_request)?;
     let authorized_domains =
         validate_resource_authorized_domains_for_registrar(&state, &submission)?;
@@ -519,6 +529,7 @@ async fn register_resource_with_raw_document(
         "didDocumentHash": did_document_hash,
         "metadataHash": submission.metadata_hash,
         "packageHash": submission.package_hash,
+        "didDocument": submission.did_document,
         "authorizedDomains": authorized_domains,
         "registrationCredential": registration_credential,
         "rootResponse": body,
@@ -567,6 +578,22 @@ async fn register_resource_with_raw_document(
         }
     }
     write_resource_record(&state, &record).await?;
+    if submission
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.controller_did.as_deref())
+        == Some(submission.resource_did.as_str())
+    {
+        if let Err(error) =
+            upsert_controller_index_from_document(&state, &submission.did_document).await
+        {
+            eprintln!(
+                "resource {} accepted but controller index update is pending: {error}",
+                submission.resource_did
+            );
+        }
+    }
     Ok(Json(json!({
         "status": "submitted",
         "resourceDid": record["resourceDid"],
@@ -593,7 +620,7 @@ fn verify_registration_did_document_for_wire(
     }
 }
 
-fn verify_controller_authorization_for_submission(
+async fn verify_controller_authorization_for_submission(
     state: &AppState,
     submission: &ResourceRegistrationSubmission,
 ) -> std::result::Result<Option<String>, String> {
@@ -641,6 +668,7 @@ fn verify_controller_authorization_for_submission(
         );
         message
     })?;
+    validate_controller_index(state, &bundle.controller_did_document, &verification_method).await?;
     verify_and_store_nonce(
         &state.config.paths.controller_authorization_nonce_file,
         &bundle.challenge.nonce,
@@ -661,6 +689,206 @@ fn verify_controller_authorization_for_submission(
         message
     })?;
     Ok(Some(verification_method))
+}
+
+fn controller_index_key(controller_did: &str, verification_method: &str) -> String {
+    format!(
+        "{}--{}",
+        did_to_file_name(controller_did),
+        did_to_file_name(verification_method)
+    )
+}
+
+async fn read_controller_index(
+    state: &AppState,
+    controller_did: &str,
+    verification_method: &str,
+) -> Result<Option<Value>> {
+    let key = controller_index_key(controller_did, verification_method);
+    if let Some(sqlite) = &state.sqlite {
+        return sqlite
+            .read_json("registrar.controller_index", &key)
+            .await
+            .map_err(Into::into);
+    }
+    if let Some(postgres) = &state.postgres {
+        return postgres
+            .read_json("registrar.controller_index", &key)
+            .await
+            .map_err(Into::into);
+    }
+    Ok(state.data.read(format!("controller-index/{key}.json")).ok())
+}
+
+async fn write_controller_index(state: &AppState, projection: &Value) -> Result<()> {
+    let controller_did = projection
+        .get("controllerDid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("controller_did_missing"))?;
+    let verification_method = projection
+        .get("verificationMethod")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("controller_verification_method_missing"))?;
+    let key = controller_index_key(controller_did, verification_method);
+    if let Some(sqlite) = &state.sqlite {
+        sqlite
+            .upsert_json("registrar.controller_index", &key, projection)
+            .await?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        postgres
+            .upsert_json("registrar.controller_index", &key, projection)
+            .await?;
+        return Ok(());
+    }
+    state
+        .data
+        .write(format!("controller-index/{key}.json"), projection)?;
+    Ok(())
+}
+
+async fn upsert_controller_index_from_document(
+    state: &AppState,
+    document: &DidDocument,
+) -> Result<()> {
+    let controller_did = match document.controller.as_ref() {
+        Some(oan_core::DidController::Did(did)) if did == &document.id => did.as_str(),
+        Some(oan_core::DidController::Dids(dids))
+            if dids.len() == 1 && dids.first() == Some(&document.id) =>
+        {
+            document.id.as_str()
+        }
+        _ => return Err(anyhow!("controller_self_ownership_missing")),
+    };
+    let method = document
+        .verification_method
+        .iter()
+        .find(|method| method.id == format!("{controller_did}#key-1"))
+        .or_else(|| document.verification_method.first())
+        .ok_or_else(|| anyhow!("controller_verification_method_missing"))?;
+    let projection = json!({
+        "controllerDid": controller_did,
+        "verificationMethod": method.id,
+        "publicKeyJwk": method.public_key_jwk,
+        "methodHash": hash_json_with_suite(CryptoSuite::Ed25519Sha256, method)?,
+        "routingCode": controller_did.split(':').nth(2).unwrap_or_default(),
+        "status": "active",
+        "updatedAt": Utc::now(),
+    });
+    write_controller_index(state, &projection).await
+}
+
+async fn backfill_controller_index(state: &AppState) -> Result<usize> {
+    let mut repaired = 0usize;
+    let mut scanned = 0usize;
+    let mut cursor: Option<NamespacePageCursor> = None;
+    loop {
+        if scanned >= CONTROLLER_INDEX_BACKFILL_MAX_RECORDS {
+            break;
+        }
+        let remaining = CONTROLLER_INDEX_BACKFILL_MAX_RECORDS - scanned;
+        let requested_limit = u32::try_from(remaining)
+            .unwrap_or(CONTROLLER_INDEX_BACKFILL_PAGE_SIZE)
+            .min(CONTROLLER_INDEX_BACKFILL_PAGE_SIZE);
+        let page = if let Some(sqlite) = &state.sqlite {
+            sqlite
+                .read_namespace_page::<Value>(
+                    "registrar.resource_records",
+                    cursor.as_ref(),
+                    Some(requested_limit),
+                    QueryLimits::default(),
+                )
+                .await?
+        } else if let Some(postgres) = &state.postgres {
+            postgres
+                .read_namespace_page::<Value>(
+                    "registrar.resource_records",
+                    cursor.as_ref(),
+                    Some(requested_limit),
+                    QueryLimits::default(),
+                )
+                .await?
+        } else {
+            break;
+        };
+        scanned += page.items.len();
+        for record in page.items {
+            let document_value = record
+                .get("didDocument")
+                .cloned()
+                .or_else(|| record.get("rootResponse")?.get("didDocument").cloned());
+            let Some(document_value) = document_value else {
+                continue;
+            };
+            let Ok(document) = serde_json::from_value::<DidDocument>(document_value) else {
+                continue;
+            };
+            let is_self_controller = matches!(
+                document.controller.as_ref(),
+                Some(oan_core::DidController::Did(did)) if did == &document.id
+            ) || matches!(
+                document.controller.as_ref(),
+                Some(oan_core::DidController::Dids(dids))
+                    if dids.len() == 1 && dids.first() == Some(&document.id)
+            );
+            if !is_self_controller {
+                continue;
+            }
+            if upsert_controller_index_from_document(state, &document)
+                .await
+                .is_ok()
+            {
+                repaired += 1;
+            }
+        }
+        if !page.has_more {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    Ok(repaired)
+}
+
+async fn validate_controller_index(
+    state: &AppState,
+    controller_document: &DidDocument,
+    verification_method: &str,
+) -> std::result::Result<(), String> {
+    let controller_did = controller_document.id.as_str();
+    let registrar_routing_code = routing_code_from_did(&state.did)
+        .map_err(|_| "controller_routing_code_mismatch".to_owned())?;
+    let controller_routing_code = routing_code_from_did(controller_did)
+        .map_err(|_| "controller_routing_code_mismatch".to_owned())?;
+    if controller_routing_code != registrar_routing_code {
+        return Err("controller_routing_code_mismatch".to_owned());
+    }
+    let projection = read_controller_index(state, controller_did, verification_method)
+        .await
+        .map_err(|_| "controller_index_not_ready".to_owned())?
+        .ok_or_else(|| "controller_not_registered".to_owned())?;
+    if projection.get("status").and_then(Value::as_str) != Some("active") {
+        return Err("controller_not_registered".to_owned());
+    }
+    let method = controller_document
+        .verification_method
+        .iter()
+        .find(|method| method.id == verification_method)
+        .ok_or_else(|| "controller_authorization_method_missing".to_owned())?;
+    let method_hash = hash_json_with_suite(CryptoSuite::Ed25519Sha256, method)
+        .map_err(|_| "controller_verification_method_mismatch".to_owned())?;
+    if projection.get("methodHash").and_then(Value::as_str) != Some(method_hash.as_str()) {
+        return Err("controller_verification_method_mismatch".to_owned());
+    }
+    Ok(())
+}
+
+fn routing_code_from_did(did: &str) -> std::result::Result<&str, ()> {
+    let mut parts = did.split(':');
+    if parts.next() != Some("did") || parts.next() != Some("oan") {
+        return Err(());
+    }
+    parts.next().ok_or(())
 }
 
 fn validate_resource_authorized_domains_for_registrar(
