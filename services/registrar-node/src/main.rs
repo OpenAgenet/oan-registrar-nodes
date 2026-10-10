@@ -881,11 +881,7 @@ async fn validate_controller_index(
     verification_method: &str,
 ) -> std::result::Result<(), String> {
     let controller_did = controller_document.id.as_str();
-    let registrar_routing_code = routing_code_from_did(&state.did)
-        .map_err(|_| "controller_routing_code_mismatch".to_owned())?;
-    let controller_routing_code = routing_code_from_did(controller_did)
-        .map_err(|_| "controller_routing_code_mismatch".to_owned())?;
-    if controller_routing_code != registrar_routing_code {
+    if validate_resource_routing_code(controller_did, &state.did).is_err() {
         return Err("controller_routing_code_mismatch".to_owned());
     }
     let projection = read_controller_index(state, controller_did, verification_method)
@@ -906,14 +902,6 @@ async fn validate_controller_index(
         return Err("controller_verification_method_mismatch".to_owned());
     }
     Ok(())
-}
-
-fn routing_code_from_did(did: &str) -> std::result::Result<&str, ()> {
-    let mut parts = did.split(':');
-    if parts.next() != Some("did") || parts.next() != Some("oan") {
-        return Err(());
-    }
-    parts.next().ok_or(())
 }
 
 fn validate_resource_authorized_domains_for_registrar(
