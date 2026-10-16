@@ -487,9 +487,9 @@ async fn register_resource_with_raw_document(
     submission: ResourceRegistrationSubmission,
     raw_did_document: Value,
 ) -> ApiResult<Value> {
-    submission.validate_shape().map_err(ApiError::bad_request)?;
     validate_resource_routing_code(&submission.resource_did, &state.did)
         .map_err(ApiError::bad_request)?;
+    submission.validate_shape().map_err(ApiError::bad_request)?;
     let verified_controller_method =
         verify_controller_authorization_for_submission(&state, &submission)
             .await
