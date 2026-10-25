@@ -1289,11 +1289,14 @@ async fn registrar_stats_body(state: &AppState) -> Result<Value> {
     let today_text = today.to_string();
     let week_start_text = week_start.to_string();
     let month_start_text = month_start.to_string();
-    let (resource_record_count, type_counts, today_count, week_count, month_count) = if let Some(
-        sqlite,
-    ) =
-        &state.sqlite
-    {
+    let (
+        resource_record_count,
+        controller_count,
+        type_counts,
+        today_count,
+        week_count,
+        month_count,
+    ) = if let Some(sqlite) = &state.sqlite {
         let row = sqlx::query(
                 "SELECT
                     COUNT(*) AS total,
@@ -1301,6 +1304,7 @@ async fn registrar_stats_body(state: &AppState) -> Result<Value> {
                     SUM(CASE WHEN json_extract(value_json, '$.resourceType') = 'skill' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN json_extract(value_json, '$.resourceType') = 'mcp_server' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN json_extract(value_json, '$.resourceType') = 'tool_api' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN json_extract(value_json, '$.resourceType') = 'controller' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN substr(json_extract(value_json, '$.submittedAt'), 1, 10) = ? THEN 1 ELSE 0 END),
                     SUM(CASE WHEN substr(json_extract(value_json, '$.submittedAt'), 1, 10) >= ? THEN 1 ELSE 0 END),
                     SUM(CASE WHEN substr(json_extract(value_json, '$.submittedAt'), 1, 10) >= ? THEN 1 ELSE 0 END)
@@ -1315,15 +1319,16 @@ async fn registrar_stats_body(state: &AppState) -> Result<Value> {
             .await?;
         (
             row.get::<i64, _>(0) as usize,
+            row.get::<Option<i64>, _>(5).unwrap_or(0),
             [
                 row.get::<Option<i64>, _>(1).unwrap_or(0),
                 row.get::<Option<i64>, _>(2).unwrap_or(0),
                 row.get::<Option<i64>, _>(3).unwrap_or(0),
                 row.get::<Option<i64>, _>(4).unwrap_or(0),
             ],
-            row.get::<Option<i64>, _>(5).unwrap_or(0),
             row.get::<Option<i64>, _>(6).unwrap_or(0),
             row.get::<Option<i64>, _>(7).unwrap_or(0),
+            row.get::<Option<i64>, _>(8).unwrap_or(0),
         )
     } else if let Some(postgres) = &state.postgres {
         let row = sqlx::query(
@@ -1333,6 +1338,7 @@ async fn registrar_stats_body(state: &AppState) -> Result<Value> {
                     COUNT(*) FILTER (WHERE value_json::jsonb ->> 'resourceType' = 'skill'),
                     COUNT(*) FILTER (WHERE value_json::jsonb ->> 'resourceType' = 'mcp_server'),
                     COUNT(*) FILTER (WHERE value_json::jsonb ->> 'resourceType' = 'tool_api'),
+                    COUNT(*) FILTER (WHERE value_json::jsonb ->> 'resourceType' = 'controller'),
                     COUNT(*) FILTER (WHERE LEFT(value_json::jsonb ->> 'submittedAt', 10) = $1),
                     COUNT(*) FILTER (WHERE LEFT(value_json::jsonb ->> 'submittedAt', 10) >= $2),
                     COUNT(*) FILTER (WHERE LEFT(value_json::jsonb ->> 'submittedAt', 10) >= $3)
@@ -1347,19 +1353,20 @@ async fn registrar_stats_body(state: &AppState) -> Result<Value> {
         .await?;
         (
             row.get::<i64, _>(0) as usize,
+            row.get::<i64, _>(5),
             [
                 row.get::<i64, _>(1),
                 row.get::<i64, _>(2),
                 row.get::<i64, _>(3),
                 row.get::<i64, _>(4),
             ],
-            row.get::<i64, _>(5),
             row.get::<i64, _>(6),
             row.get::<i64, _>(7),
+            row.get::<i64, _>(8),
         )
     } else {
         let records = read_resource_records(state).await?;
-        let mut type_counts = [0_i64; 4];
+        let mut type_counts = [0_i64; 5];
         let mut today_count = 0_i64;
         let mut week_count = 0_i64;
         let mut month_count = 0_i64;
@@ -1375,7 +1382,13 @@ async fn registrar_stats_body(state: &AppState) -> Result<Value> {
         }
         (
             records.len(),
-            type_counts,
+            type_counts[4],
+            [
+                type_counts[0],
+                type_counts[1],
+                type_counts[2],
+                type_counts[3],
+            ],
             today_count,
             week_count,
             month_count,
@@ -1386,6 +1399,7 @@ async fn registrar_stats_body(state: &AppState) -> Result<Value> {
         "generatedAt": generated_at.to_rfc3339(),
         "windowTimezone": "UTC",
         "resourceRecordCount": resource_record_count,
+        "controllerCount": controller_count,
         "agentServiceCount": type_counts[0],
         "skillCount": type_counts[1],
         "mcpServerCount": type_counts[2],
@@ -1398,7 +1412,7 @@ async fn registrar_stats_body(state: &AppState) -> Result<Value> {
 
 fn accumulate_registrar_stats(
     record: &Value,
-    type_counts: &mut [i64; 4],
+    type_counts: &mut [i64; 5],
     today_count: &mut i64,
     week_count: &mut i64,
     month_count: &mut i64,
@@ -1409,6 +1423,7 @@ fn accumulate_registrar_stats(
         Some("skill") => type_counts[1] += 1,
         Some("mcp_server") => type_counts[2] += 1,
         Some("tool_api") => type_counts[3] += 1,
+        Some("controller") => type_counts[4] += 1,
         _ => {}
     }
     let Some(submitted_at) = record.get("submittedAt").and_then(Value::as_str) else {
@@ -1461,7 +1476,9 @@ async fn report_registrar_stats_once(state: &AppState) -> Result<()> {
         "status": "online",
         "generatedAt": stats["generatedAt"],
         "resourceTotals": {
-            "registeredResources": stats["resourceRecordCount"]
+            "registeredResources": stats["resourceRecordCount"].as_u64().unwrap_or(0)
+                .saturating_sub(stats["controllerCount"].as_u64().unwrap_or(0)),
+            "totalControllers": stats["controllerCount"]
         },
         "resourcesByType": {
             "agentService": stats["agentServiceCount"],
