@@ -53,6 +53,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
@@ -175,6 +176,7 @@ struct AppState {
     postgres: Option<PostgresJsonStore>,
     client: reqwest::Client,
     recommender: Arc<SemanticRecommender>,
+    stats_cache: Arc<tokio::sync::Mutex<Option<(Instant, Value)>>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -316,6 +318,7 @@ async fn async_main() -> Result<()> {
         postgres,
         client: reqwest::Client::new(),
         recommender: Arc::new(SemanticRecommender::new()?),
+        stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -1282,6 +1285,19 @@ async fn api_stats(State(state): State<AppState>) -> ApiResult<Value> {
 }
 
 async fn registrar_stats_body(state: &AppState) -> Result<Value> {
+    // Serialize cache misses so the HTTP endpoint and reporter share one scan.
+    let mut cache = state.stats_cache.lock().await;
+    if let Some((captured, body)) = cache.as_ref() {
+        if captured.elapsed() < std::time::Duration::from_secs(60) {
+            return Ok(body.clone());
+        }
+    }
+    let body = compute_registrar_stats_body(state).await?;
+    *cache = Some((Instant::now(), body.clone()));
+    Ok(body)
+}
+
+async fn compute_registrar_stats_body(state: &AppState) -> Result<Value> {
     let generated_at = Utc::now();
     let today = generated_at.date_naive();
     let week_start = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
