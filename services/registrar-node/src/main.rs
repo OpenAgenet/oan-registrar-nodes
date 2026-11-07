@@ -20,9 +20,9 @@ use oan_credentials::{
     ResourceRegistrationCredentialSubject,
 };
 use oan_crypto::{
-    hash_json_with_suite, signing_key_from_private_key_jwk, verify_did_document_proof,
-    verify_did_document_proof_standard_value_blocking, verify_payload_with_proof,
-    verifying_key_from_method, SigningKey,
+    hash_json_with_suite, signing_key_from_private_key_jwk,
+    verify_did_document_proof_compatible_value_isolated, verify_payload_with_proof,
+    verifying_key_from_method, SigningKey, VerifiedWireDidDocument,
 };
 use oan_protocol::{
     validate_resource_routing_code, HealthResponse, RegistrationCredentialQueryRequest,
@@ -199,7 +199,6 @@ struct ControllerBackfillState {
     updated_at: String,
     record_key: String,
 }
-
 
 #[derive(Debug, Serialize)]
 struct ErrorBody {
@@ -478,17 +477,17 @@ async fn register_resource_raw(
         .get("didDocument")
         .cloned()
         .ok_or_else(|| ApiError::bad_request("did_document_missing"))?;
-    verify_registration_did_document_for_wire(did_document.clone())?;
+    let verified_did_document = verify_registration_did_document_for_wire(did_document).await?;
     let submission: ResourceRegistrationSubmission = serde_json::from_value(payload)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    register_resource_with_raw_document(state, submission, did_document).await
+    register_resource_with_raw_document(state, submission, verified_did_document).await
 }
 
 
 async fn register_resource_with_raw_document(
     state: AppState,
     submission: ResourceRegistrationSubmission,
-    raw_did_document: Value,
+    verified_did_document: VerifiedWireDidDocument,
 ) -> ApiResult<Value> {
     validate_resource_routing_code(&submission.resource_did, &state.did)
         .map_err(ApiError::bad_request)?;
@@ -499,11 +498,10 @@ async fn register_resource_with_raw_document(
             .map_err(ApiError::bad_request)?;
     let authorized_domains =
         validate_resource_authorized_domains_for_registrar(&state, &submission)?;
-    verify_registration_did_document_for_wire(raw_did_document.clone())?;
     let request = build_resource_verify_and_publish_request_with_raw(
         &state,
         submission.clone(),
-        raw_did_document.clone(),
+        verified_did_document.as_value().clone(),
     )?;
     let response = state
         .client
@@ -613,21 +611,12 @@ async fn register_resource_with_raw_document(
     })))
 }
 
-fn verify_registration_did_document_for_wire(
+async fn verify_registration_did_document_for_wire(
     raw_did_document: Value,
-) -> std::result::Result<(), ApiError> {
-    match verify_did_document_proof_standard_value_blocking(raw_did_document.clone()) {
-        Ok(()) => Ok(()),
-        Err(standard_error) => {
-            let did_document: DidDocument = serde_json::from_value(raw_did_document)
-                .map_err(|error| ApiError::bad_request(error.to_string()))?;
-            verify_did_document_proof(&did_document).map_err(|fallback_error| {
-                ApiError::bad_request(format!(
-                    "did_document_proof_invalid: {standard_error}; fallback: {fallback_error}"
-                ))
-            })
-        }
-    }
+) -> std::result::Result<VerifiedWireDidDocument, ApiError> {
+    verify_did_document_proof_compatible_value_isolated(raw_did_document)
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
 async fn verify_controller_authorization_for_submission(
@@ -654,6 +643,7 @@ async fn verify_controller_authorization_for_submission(
         serde_json::to_value(&bundle.controller_did_document)
             .map_err(|_| "controller_did_document_proof_invalid".to_owned())?,
     )
+    .await
     .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
     let expected_publisher_did = metadata.publisher_did.as_deref();
     let verification_method = verify_controller_authorization_proof(
