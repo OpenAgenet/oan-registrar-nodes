@@ -3,6 +3,10 @@
 // Initial author: JINLIANG XU
 // Email: jlxufly@gmail.com
 
+mod config;
+mod runtime_config;
+use config::*;
+
 use anyhow::{anyhow, Result};
 use axum::{
     extract::{Path as AxumPath, Query, State},
@@ -48,123 +52,8 @@ use oan_storage::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
-use std::{
-    env,
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
-};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
-
-#[derive(Clone, Debug, Deserialize)]
-struct Config {
-    server: ServerConfig,
-    #[serde(default)]
-    cors: CorsConfig,
-    #[serde(default)]
-    security: SecurityConfig,
-    #[serde(default)]
-    stats_report: StatsReportConfig,
-    upstream: UpstreamConfig,
-    paths: PathConfig,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ServerConfig {
-    host: String,
-    port: u16,
-    #[serde(default)]
-    endpoint: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct CorsConfig {
-    #[serde(default)]
-    allowed_origins: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct UpstreamConfig {
-    root_endpoint: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct SecurityConfig {
-    #[serde(default)]
-    upstream: UpstreamSecurityConfig,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct UpstreamSecurityConfig {
-    #[serde(default = "default_root_did")]
-    root_did: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct StatsReportConfig {
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default)]
-    node_id: Option<String>,
-    #[serde(default)]
-    endpoint: Option<String>,
-    #[serde(default)]
-    token: Option<String>,
-    #[serde(default = "default_stats_report_interval_seconds")]
-    interval_seconds: u64,
-}
-
-impl Default for StatsReportConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            node_id: None,
-            endpoint: None,
-            token: None,
-            interval_seconds: default_stats_report_interval_seconds(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct PathConfig {
-    data_dir: PathBuf,
-    #[serde(default = "default_records_dir")]
-    records_dir: PathBuf,
-    #[serde(default = "default_identity_file")]
-    identity_file: PathBuf,
-    #[serde(default = "default_controller_authorization_nonce_file")]
-    controller_authorization_nonce_file: PathBuf,
-    #[serde(default = "default_registration_credential_query_nonce_file")]
-    registration_credential_query_nonce_file: PathBuf,
-    #[serde(default)]
-    database_url: Option<String>,
-}
-
-fn default_records_dir() -> PathBuf {
-    PathBuf::from("../../data/registrar/resource-records")
-}
-
-fn default_identity_file() -> PathBuf {
-    PathBuf::from("../../data/registrar/identity.json")
-}
-
-fn default_controller_authorization_nonce_file() -> PathBuf {
-    PathBuf::from("../../data/registrar/controller-authorization-nonces.json")
-}
-
-fn default_registration_credential_query_nonce_file() -> PathBuf {
-    PathBuf::from("../../data/registrar/registration-credential-query-nonces.json")
-}
-
-fn default_root_did() -> String {
-    "did:oan:QwErT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz".to_owned()
-}
-
-fn default_stats_report_interval_seconds() -> u64 {
-    60
-}
 
 #[derive(Clone)]
 struct AppState {
@@ -266,18 +155,35 @@ const REGISTRATION_CREDENTIAL_QUERY_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 const REGISTRATION_CREDENTIAL_QUERY_NONCE_TTL_SECONDS: i64 = 600;
 
 fn main() -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(8 * 1024 * 1024)
-        .build()?
-        .block_on(async { tokio::spawn(async_main()).await? })
+    let cli = oan_config::NodeCli::parse();
+    if matches!(
+        cli.command,
+        Some(
+            oan_config::NodeCommand::SemanticRebuild(_)
+                | oan_config::NodeCommand::SemanticBackfillSkipped(_)
+                | oan_config::NodeCommand::SemanticEvaluate(_)
+                | oan_config::NodeCommand::SemanticRebuildEvaluate(_)
+        )
+    ) {
+        return Err(anyhow!(
+            "semantic commands are supported only by discovery-node"
+        ));
+    }
+    if cli.legacy_config.is_some() {
+        eprintln!("deprecated positional configuration path; use --config");
+    }
+    let path = cli.path("services/registrar-node/config.example.toml")?;
+    let (config, sources) = load_config_details(path.to_string_lossy().into_owned())?;
+    if cli.inspect(&config, &sources)? {
+        return Ok(());
+    }
+    let runtime = config.runtime.build()?;
+    oan_crypto::initialize_did_verification_executor(config.runtime.did_verification)
+        .map_err(|e| anyhow!(e))?;
+    runtime.block_on(async { tokio::spawn(async_main(config)).await? })
 }
 
-async fn async_main() -> Result<()> {
-    let config_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "services/registrar-node/config.example.toml".to_owned());
-    let config = load_config(config_path)?;
+async fn async_main(config: Config) -> Result<()> {
     validate_stats_report_config(&config.stats_report)?;
     let identity: OanIdentity = JsonStore::new(".").read(&config.paths.identity_file)?;
     identity
@@ -297,11 +203,19 @@ async fn async_main() -> Result<()> {
             let database = DatabaseConfig::parse(url)?;
             match database.backend() {
                 DatabaseBackend::Sqlite => {
-                    let sqlite = SqliteJsonStore::connect(url).await?;
+                    let sqlite = SqliteJsonStore::connect_with_pool(
+                        url,
+                        &runtime_config::pool_options(&config.database.pool, url)?,
+                    )
+                    .await?;
                     (Some(sqlite), None)
                 }
                 DatabaseBackend::Postgres => {
-                    let postgres = PostgresJsonStore::connect(url).await?;
+                    let postgres = PostgresJsonStore::connect_with_pool(
+                        url,
+                        &runtime_config::pool_options(&config.database.pool, url)?,
+                    )
+                    .await?;
                     (None, Some(postgres))
                 }
             }
@@ -372,23 +286,6 @@ async fn async_main() -> Result<()> {
     Ok(())
 }
 
-fn load_config(path: String) -> Result<Config> {
-    let path = PathBuf::from(path);
-    let mut config: Config = toml::from_str(&std::fs::read_to_string(&path)?)?;
-    let base = path.parent().unwrap_or_else(|| Path::new("."));
-    config.paths.data_dir = resolve_relative(base, &config.paths.data_dir);
-    config.paths.records_dir = resolve_relative(base, &config.paths.records_dir);
-    config.paths.identity_file = resolve_relative(base, &config.paths.identity_file);
-    config.paths.controller_authorization_nonce_file =
-        resolve_relative(base, &config.paths.controller_authorization_nonce_file);
-    config.paths.registration_credential_query_nonce_file =
-        resolve_relative(base, &config.paths.registration_credential_query_nonce_file);
-    if let Some(database_url) = config.paths.database_url.as_mut() {
-        *database_url = resolve_database_url(base, database_url);
-    }
-    Ok(config)
-}
-
 fn validate_stats_report_config(config: &StatsReportConfig) -> Result<()> {
     if !config.enabled {
         return Ok(());
@@ -420,25 +317,6 @@ fn validate_stats_report_config(config: &StatsReportConfig) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn resolve_relative(base: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base.join(path)
-    }
-}
-
-fn resolve_database_url(base: &Path, url: &str) -> String {
-    let Some(raw_path) = url
-        .strip_prefix("sqlite://")
-        .or_else(|| url.strip_prefix("sqlite:"))
-    else {
-        return url.to_owned();
-    };
-    let resolved = resolve_relative(base, Path::new(raw_path));
-    format!("sqlite:{}", resolved.display())
 }
 
 fn build_cors_layer(config: &CorsConfig) -> Result<CorsLayer> {

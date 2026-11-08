@@ -11,21 +11,13 @@ allowed_origins = [
   "https://openagenet.github.io/oan-site",
 ]
 
-[node]
-name = "Registrar Node"
-role = "registrar"
 
 [upstream]
 root_endpoint = "http://localhost:8000"
 
 [security.upstream]
-protocol_label = "ans-2026"
 root_did = "did:oan:QwErT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz"
 
-[security.submit]
-max_in_flight = 32
-retry_after_seconds = 1
-upstream_timeout_ms = 15000
 
 [stats_report]
 enabled = false
@@ -41,3 +33,17 @@ identity_file = "../../data/registrar/identity.json"
 controller_authorization_nonce_file = "../../data/registrar/controller-authorization-nonces.json"
 registration_credential_query_nonce_file = "../../data/registrar/registration-credential-query-nonces.json"
 database_url = "postgres://postgres:postgres@127.0.0.1:5432/oan_registrar"
+
+# Optional runtime overrides; omitted values preserve the previous node defaults.
+[runtime.tokio]
+thread_stack_size_mib = 8
+
+[runtime.did_verification]
+worker_count = 6
+queue_capacity = 12
+worker_stack_size_mib = 16
+
+# Backend-specific defaults: PostgreSQL 8 connections; SQLite 32; acquire timeout 30s.
+# [database.pool]
+# max_connections = 8
+# acquire_timeout_seconds = 30

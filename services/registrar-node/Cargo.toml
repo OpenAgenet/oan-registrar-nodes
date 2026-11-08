@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+oan-config = { path = "../../../oan-protocol-common/crates/oan-config" }
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true

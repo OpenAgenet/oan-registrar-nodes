@@ -58,3 +58,43 @@ identity material.
 
 This core service repository is licensed under `Apache-2.0`. Brand and
 official-node identity rights are reserved separately.
+
+
+## Typed configuration and offline checks
+
+The service loads one UTF-8 TOML file. Precedence is code defaults, TOML,
+legacy database-pool environment variables (where applicable), then `OAN_REGISTRAR__...`
+scalar environment overrides. `--config` selects the file; it does not silently
+create one when missing. Unknown fields, duplicate aliases, invalid types and
+invalid runtime capacities are rejected. Configuration changes require restart.
+
+```text
+registrar-node --config services/registrar-node/config.example.toml check-config
+registrar-node --config services/registrar-node/config.example.toml print-effective-config
+```
+
+These commands run without starting Tokio, opening a database, reading identity
+material, connecting upstream, creating directories or writing runtime state.
+The effective-config command prints redacted JSON plus per-field sources;
+it is for inspection, not a round-trippable deployment file. URLs/endpoints and
+tokens are hidden. Preserve the original protected configuration for deployment.
+
+The old positional config path remains accepted. Relative paths remain based on
+the configuration directory. `OAN_REGISTRAR__RUNTIME__DID_VERIFICATION__WORKER_COUNT=4`
+is an example override, not the default. Omitted verification settings retain
+6 workers, a bounded queue of 12, and 16 MiB worker stacks. Tokio retains an
+8 MiB stack; omitted Tokio worker/blocking counts retain runtime defaults.
+
+`[database.pool]` supports `max_connections` and `acquire_timeout_seconds`.
+PostgreSQL additionally supports `idle_timeout_seconds` and
+`max_lifetime_seconds`. Defaults remain PostgreSQL 8 / SQLite 32 connections,
+30 seconds acquisition timeout, and PostgreSQL idle/lifetime 30/300 seconds.
+Existing `OAN_POSTGRES_*` / `OAN_SQLITE_*` pool variables remain compatible;
+module-prefixed overrides take precedence. The backend still comes exclusively
+from `paths.database_url`; an absent/empty URL retains file storage.
+
+Remove previously unused `[node]` sections before enabling strict checks.
+Arrays remain TOML-only; environment list splitting is not supported.
+No identities, credentials, business records, nonce state or indexes are migrated.
+
+Remove unused `[security.submit]` and `security.upstream.protocol_label` fields. This change does not add admission limits or change upstream HTTP timeout policy.
