@@ -66,3 +66,4 @@ pub(super) fn pool_options(
         max_lifetime_seconds: resolved.max_lifetime_seconds,
     })
 }
+
