@@ -41,7 +41,7 @@ use oan_semantic_recommender::{
 };
 use oan_service_security::{
     create_signed_request_envelope, find_relationship_method, request_id, request_nonce,
-    verify_and_store_nonce, verify_controller_authorization_proof,
+    verify_and_store_nonce, verify_controller_authorization_proof_with_document,
     ControllerAuthorizationVerificationContext, SignedRequestEnvelopeInput,
     VerificationRelationship,
 };
@@ -370,10 +370,9 @@ async fn register_resource_with_raw_document(
     validate_resource_routing_code(&submission.resource_did, &state.did)
         .map_err(ApiError::bad_request)?;
     submission.validate_shape().map_err(ApiError::bad_request)?;
-    let verified_controller_method =
-        verify_controller_authorization_for_submission(&state, &submission)
-            .await
-            .map_err(ApiError::bad_request)?;
+    verify_controller_authorization_for_submission(&state, &submission)
+        .await
+        .map_err(ApiError::bad_request)?;
     let authorized_domains =
         validate_resource_authorized_domains_for_registrar(&state, &submission)?;
     let request = build_resource_verify_and_publish_request_with_raw(
@@ -403,6 +402,7 @@ async fn register_resource_with_raw_document(
                 .to_owned(),
         });
     }
+    validate_root_acceptance_response(&body, &submission)?;
     let did_document_hash =
         hash_json_with_suite(state.signing_key.crypto_suite(), &submission.did_document)
             .map_err(ApiError::internal)?;
@@ -421,47 +421,8 @@ async fn register_resource_with_raw_document(
         "rootResponse": body,
         "submittedAt": chrono::Utc::now()
     });
-    if let Some(verification_method) = verified_controller_method {
-        if let Some(controller_did) = submission
-            .did_document
-            .oan_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.controller_did.as_deref())
-        {
-            let controller_method_hash = submission
-                .controller_authorization_proof
-                .as_ref()
-                .and_then(|bundle| {
-                    controller_method_hash(
-                        &state,
-                        &bundle.controller_did_document,
-                        &verification_method,
-                    )
-                    .ok()
-                })
-                .ok_or_else(|| ApiError::bad_request("controller_authorization_method_missing"))?;
-            record["registrationCredentialAccess"] = json!({
-                "enabled": true,
-                "controllerDid": controller_did,
-                "verifiedVerificationMethod": verification_method,
-                "verifiedControllerMethodHash": controller_method_hash,
-                "verifiedAuthorityBindingHash": hash_json_with_suite(
-                    state.signing_key.crypto_suite(),
-                    &json!({
-                        "resourceDid": submission.resource_did,
-                        "controllerDid": controller_did,
-                        "verificationMethod": verification_method,
-                        "didDocumentHash": submission.did_document_hash,
-                        "metadataHash": submission.metadata_hash,
-                        "registrarDid": state.did,
-                        "purpose": PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION
-                    })
-                )
-                .map_err(ApiError::internal)?,
-                "verifiedAt": Utc::now(),
-                "policyVersion": "registration-credential-access-v1"
-            });
-        }
+    if let Some(access) = build_registration_credential_access(&state, &submission).await {
+        record["registrationCredentialAccess"] = access;
     }
     write_resource_record(&state, &record).await?;
     if submission
@@ -500,36 +461,111 @@ async fn verify_registration_did_document_for_wire(
 async fn verify_controller_authorization_for_submission(
     state: &AppState,
     submission: &ResourceRegistrationSubmission,
-) -> std::result::Result<Option<String>, String> {
-    let Some(metadata) = submission.did_document.oan_metadata.as_ref() else {
-        return Ok(None);
+) -> std::result::Result<(), String> {
+    let next_controller_did = submission
+        .did_document
+        .registration_controller()
+        .map_err(|error| error.to_string())?
+        .0;
+    let current_record = match read_resource_record(state, &submission.resource_did).await {
+        Ok(record) => record,
+        Err(error) => {
+            eprintln!(
+                "local resource state unavailable for {}; Root will decide: {error}",
+                submission.resource_did
+            );
+            return Ok(());
+        }
     };
-    let Some(controller_did) = metadata.controller_did.as_deref() else {
-        return Ok(None);
+    let (authorizer_did, trusted_document, authoritative_local_state) = if let Some(record) =
+        current_record
+    {
+        let current_document: DidDocument = match record
+            .get("didDocument")
+            .cloned()
+            .ok_or_else(|| "resource_record_did_document_missing".to_owned())
+            .and_then(|value| {
+                serde_json::from_value(value)
+                    .map_err(|_| "resource_record_did_document_invalid".to_owned())
+            }) {
+            Ok(document) => document,
+            Err(error) => {
+                eprintln!(
+                    "local resource state is unusable for {}; Root will decide: {error}",
+                    submission.resource_did
+                );
+                return Ok(());
+            }
+        };
+        let current_controller_did = match current_document
+            .registration_controller()
+            .map_err(|error| error.to_string())
+        {
+            Ok((controller_did, _)) => controller_did,
+            Err(error) => {
+                eprintln!(
+                    "local controller state is unusable for {}; Root will decide: {error}",
+                    submission.resource_did
+                );
+                return Ok(());
+            }
+        };
+        if current_controller_did == submission.resource_did {
+            return Ok(());
+        }
+        let document = match read_registered_resource_document(state, &current_controller_did).await
+        {
+            Ok(Some(document)) => document,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                eprintln!(
+                    "local authorizer state is unusable for {}; Root will decide: {error}",
+                    submission.resource_did
+                );
+                return Ok(());
+            }
+        };
+        (current_controller_did, document, false)
+    } else {
+        if next_controller_did == submission.resource_did {
+            return Ok(());
+        }
+        let bundle = submission
+            .controller_authorization_proof
+            .as_ref()
+            .ok_or_else(|| "controller_authorization_proof_required".to_owned())?;
+        let document = match read_registered_resource_document(state, &next_controller_did).await? {
+            Some(document) => document,
+            None => {
+                validate_controller_index(
+                    state,
+                    &bundle.controller_did_document,
+                    &bundle.challenge.verification_method,
+                )
+                .await?;
+                bundle.controller_did_document.clone()
+            }
+        };
+        (next_controller_did, document, true)
     };
-    if controller_did == submission.resource_did {
-        return Ok(None);
-    }
     let Some(bundle) = submission.controller_authorization_proof.as_ref() else {
-        eprintln!(
-            "controller authorization proof missing for resource {} controlled by {}",
-            submission.resource_did, controller_did
-        );
-        return Err("controller_authorization_proof_required".to_owned());
+        return if authoritative_local_state {
+            Err("controller_authorization_proof_required".to_owned())
+        } else {
+            Ok(())
+        };
     };
-    verify_registration_did_document_for_wire(
-        serde_json::to_value(&bundle.controller_did_document)
-            .map_err(|_| "controller_did_document_proof_invalid".to_owned())?,
-    )
-    .await
-    .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
-    let expected_publisher_did = metadata.publisher_did.as_deref();
-    let verification_method = verify_controller_authorization_proof(
+    let result = verify_controller_authorization_proof_with_document(
         bundle,
+        &trusted_document,
         &ControllerAuthorizationVerificationContext {
             expected_resource_did: &submission.resource_did,
-            expected_controller_did: controller_did,
-            expected_publisher_did,
+            expected_controller_did: &authorizer_did,
+            expected_publisher_did: submission
+                .did_document
+                .oan_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.publisher_did.as_deref()),
             expected_did_document_hash: &submission.did_document_hash,
             expected_metadata_hash: &submission.metadata_hash,
             expected_registrar_did: &state.did,
@@ -537,36 +573,145 @@ async fn verify_controller_authorization_for_submission(
             max_clock_skew_seconds: 60,
             now: Utc::now(),
         },
+    );
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if !authoritative_local_state => {
+            eprintln!(
+                "local controller precheck deferred to Root for resource {}: {}",
+                submission.resource_did, error
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn validate_root_acceptance_response(
+    body: &Value,
+    submission: &ResourceRegistrationSubmission,
+) -> std::result::Result<(), ApiError> {
+    let matches = body.get("status").and_then(Value::as_str)
+        == Some("resource-verified-and-queued")
+        && body.get("resourceDid").and_then(Value::as_str)
+            == Some(submission.resource_did.as_str())
+        && body.get("packageVersion").and_then(Value::as_str)
+            == Some(submission.package_version.as_str())
+        && body.get("didDocumentHash").and_then(Value::as_str)
+            == Some(submission.did_document_hash.as_str())
+        && body.get("metadataHash").and_then(Value::as_str)
+            == Some(submission.metadata_hash.as_str())
+        && body.get("packageHash").and_then(Value::as_str)
+            == Some(submission.package_hash.as_str());
+    if matches {
+        Ok(())
+    } else {
+        Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            message: "root_resource_acceptance_mismatch".to_owned(),
+        })
+    }
+}
+
+async fn read_registered_resource_document(
+    state: &AppState,
+    resource_did: &str,
+) -> std::result::Result<Option<DidDocument>, String> {
+    let Some(record) = read_resource_record(state, resource_did)
+        .await
+        .map_err(|_| "resource_record_not_ready".to_owned())?
+    else {
+        return Ok(None);
+    };
+    let document: DidDocument = record
+        .get("didDocument")
+        .cloned()
+        .ok_or_else(|| "resource_record_did_document_missing".to_owned())
+        .and_then(|value| {
+            serde_json::from_value(value)
+                .map_err(|_| "resource_record_did_document_invalid".to_owned())
+        })?;
+    if document.id != resource_did {
+        return Err("resource_record_did_document_mismatch".to_owned());
+    }
+    if document
+        .oan_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.lifecycle_state.as_deref())
+        .is_some_and(|status| status != "active")
+    {
+        return Err("controller_inactive".to_owned());
+    }
+    Ok(Some(document))
+}
+
+async fn build_registration_credential_access(
+    state: &AppState,
+    submission: &ResourceRegistrationSubmission,
+) -> Option<Value> {
+    let (controller_did, is_external) = submission.did_document.registration_controller().ok()?;
+    if !is_external {
+        return None;
+    }
+    let controller_document = match read_registered_resource_document(state, &controller_did)
+        .await
+        .ok()
+        .flatten()
+    {
+        Some(document) => document,
+        None => {
+            let bundle = submission
+                .controller_authorization_proof
+                .as_ref()
+                .filter(|bundle| bundle.controller_did_document.id == controller_did)?;
+            validate_controller_index(
+                state,
+                &bundle.controller_did_document,
+                &bundle.challenge.verification_method,
+            )
+            .await
+            .ok()?;
+            bundle.controller_did_document.clone()
+        }
+    };
+    let method = find_relationship_method(
+        &controller_document,
+        VerificationRelationship::CapabilityInvocation,
+        None,
     )
-    .map_err(|err| {
-        let message = err.to_string();
-        eprintln!(
-            "controller authorization proof rejected for resource {} controlled by {}: {}",
-            submission.resource_did, controller_did, message
-        );
-        message
-    })?;
-    validate_controller_index(state, &bundle.controller_did_document, &verification_method).await?;
-    verify_and_store_nonce(
-        &state.config.paths.controller_authorization_nonce_file,
-        &bundle.challenge.nonce,
-        Utc::now(),
-        Utc::now(),
-        300,
+    .or_else(|_| {
+        find_relationship_method(
+            &controller_document,
+            VerificationRelationship::AssertionMethod,
+            None,
+        )
+    })
+    .ok()?;
+    let verification_method = method.id.clone();
+    let controller_method_hash =
+        controller_method_hash(state, &controller_document, &verification_method).ok()?;
+    let authority_binding_hash = hash_json_with_suite(
+        state.signing_key.crypto_suite(),
+        &json!({
+            "resourceDid": submission.resource_did,
+            "controllerDid": controller_did,
+            "verificationMethod": verification_method,
+            "didDocumentHash": submission.did_document_hash,
+            "metadataHash": submission.metadata_hash,
+            "registrarDid": state.did,
+            "purpose": PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION
+        }),
     )
-    .map_err(|err| {
-        let message = if err.to_string() == "trusted_upstream_nonce_replayed" {
-            "controller_authorization_nonce_replayed".to_owned()
-        } else {
-            err.to_string()
-        };
-        eprintln!(
-            "controller authorization nonce rejected for resource {} controlled by {}: {}",
-            submission.resource_did, controller_did, message
-        );
-        message
-    })?;
-    Ok(Some(verification_method))
+    .ok()?;
+    Some(json!({
+        "enabled": true,
+        "controllerDid": controller_did,
+        "verifiedVerificationMethod": verification_method,
+        "verifiedControllerMethodHash": controller_method_hash,
+        "verifiedAuthorityBindingHash": authority_binding_hash,
+        "verifiedAt": Utc::now(),
+        "policyVersion": "registration-credential-access-v1"
+    }))
 }
 
 fn controller_index_key(controller_did: &str, verification_method: &str) -> String {
