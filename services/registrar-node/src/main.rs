@@ -42,8 +42,8 @@ use oan_semantic_recommender::{
 use oan_service_security::{
     create_signed_request_envelope, find_relationship_method, request_id, request_nonce,
     verify_and_store_nonce, verify_controller_authorization_proof_with_document,
-    ControllerAuthorizationVerificationContext, SignedRequestEnvelopeInput,
-    VerificationRelationship,
+    verify_subject_control_proof_with_clock_skew, ControllerAuthorizationVerificationContext,
+    DidControlVerificationContext, SignedRequestEnvelopeInput, VerificationRelationship,
 };
 use oan_storage::{
     did_to_file_name, DatabaseBackend, DatabaseConfig, JsonStore, NamespacePageCursor,
@@ -370,6 +370,9 @@ async fn register_resource_with_raw_document(
     validate_resource_routing_code(&submission.resource_did, &state.did)
         .map_err(ApiError::bad_request)?;
     submission.validate_shape().map_err(ApiError::bad_request)?;
+    verify_subject_control_for_submission(&state, &submission)
+        .await
+        .map_err(ApiError::bad_request)?;
     verify_controller_authorization_for_submission(&state, &submission)
         .await
         .map_err(ApiError::bad_request)?;
@@ -448,6 +451,82 @@ async fn register_resource_with_raw_document(
         "registrationCredential": record["registrationCredential"],
         "rootResponse": record["rootResponse"]
     })))
+}
+
+async fn verify_subject_control_for_submission(
+    state: &AppState,
+    submission: &ResourceRegistrationSubmission,
+) -> std::result::Result<(), String> {
+    let previous_version = submission
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.package_info.as_ref())
+        .and_then(|package_info| package_info.previous_version.as_deref());
+    let (trusted_document, authoritative_local_state) = if previous_version.is_none() {
+        (std::borrow::Cow::Borrowed(&submission.did_document), true)
+    } else {
+        let record = match read_resource_record(state, &submission.resource_did).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                eprintln!(
+                    "local subject state unavailable for {}; Root will decide: {error}",
+                    submission.resource_did
+                );
+                return Ok(());
+            }
+        };
+        let current_document: DidDocument = match record
+            .get("didDocument")
+            .cloned()
+            .ok_or_else(|| "resource_record_did_document_missing".to_owned())
+            .and_then(|value| {
+                serde_json::from_value(value)
+                    .map_err(|_| "resource_record_did_document_invalid".to_owned())
+            }) {
+            Ok(document) => document,
+            Err(error) => {
+                eprintln!(
+                    "local subject state is unusable for {}; Root will decide: {error}",
+                    submission.resource_did
+                );
+                return Ok(());
+            }
+        };
+        let current_is_self = current_document
+            .registration_controller()
+            .map(|(controller, _)| controller == submission.resource_did)
+            .unwrap_or(false);
+        if current_is_self {
+            (std::borrow::Cow::Owned(current_document), false)
+        } else {
+            (std::borrow::Cow::Borrowed(&submission.did_document), false)
+        }
+    };
+    let result = verify_subject_control_proof_with_clock_skew(
+        &submission.subject_control_proof,
+        trusted_document.as_ref(),
+        &DidControlVerificationContext {
+            expected_subject_did: &submission.resource_did,
+            expected_did_document_hash: &submission.did_document_hash,
+            expected_registrar_did: &state.did,
+            expected_purpose: "resource-registration",
+            now: Utc::now(),
+        },
+        60,
+    );
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if !authoritative_local_state => {
+            eprintln!(
+                "local subject-control precheck deferred to Root for resource {}: {}",
+                submission.resource_did, error
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 async fn verify_registration_did_document_for_wire(
@@ -537,12 +616,19 @@ async fn verify_controller_authorization_for_submission(
         let document = match read_registered_resource_document(state, &next_controller_did).await? {
             Some(document) => document,
             None => {
-                validate_controller_index(
+                if let Err(error) = validate_controller_index(
                     state,
                     &bundle.controller_did_document,
                     &bundle.challenge.verification_method,
                 )
-                .await?;
+                .await
+                {
+                    eprintln!(
+                        "local controller projection unavailable for {}; Root will decide: {error}",
+                        submission.resource_did
+                    );
+                    return Ok(());
+                }
                 bundle.controller_did_document.clone()
             }
         };
